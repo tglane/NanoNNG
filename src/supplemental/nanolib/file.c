@@ -7,14 +7,13 @@
 #include "nng/supplemental/nanolib/file.h"
 
 #ifdef NNG_PLATFORM_WINDOWS
-#define nano_mkdir(path, mode) mkdir(path)
+#define nano_mkdir(path, mode) _mkdir(path)
 #else
+#include <sys/stat.h>
 #define nano_mkdir(path, mode) mkdir(path, mode)
 #endif
 
 #ifndef NNG_PLATFORM_WINDOWS
-
-int mkdir(const char *path, mode_t mode);
 
 int64_t
 nano_getline(char **restrict line, size_t *restrict len, FILE *restrict fp)

@@ -17,10 +17,6 @@
 #include "nanolib.h"
 #include <ctype.h>
 
-#ifndef NNG_PLATFORM_WINDOWS
-int mkdir(const char *path, mode_t mode);
-#endif
-
 static void conf_bridge_parse(conf *nanomq_conf, const char *path);
 static void conf_aws_bridge_parse(conf *nanomq_conf, const char *path);
 static void conf_bridge_init(conf_bridge *bridge);
