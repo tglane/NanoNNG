@@ -16,6 +16,7 @@
 #include "nng/supplemental/nanolib/hocon.h"
 #include "nanolib.h"
 #include <ctype.h>
+#include <sys/stat.h>
 
 static void conf_bridge_parse(conf *nanomq_conf, const char *path);
 static void conf_aws_bridge_parse(conf *nanomq_conf, const char *path);
