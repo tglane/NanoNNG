@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include "core/nng_impl.h"
 #include "nng/supplemental/nanolib/file.h"
 
@@ -14,6 +13,8 @@
 #endif
 
 #ifndef NNG_PLATFORM_WINDOWS
+
+int mkdir(const char *path, mode_t mode);
 
 int64_t
 nano_getline(char **restrict line, size_t *restrict len, FILE *restrict fp)
