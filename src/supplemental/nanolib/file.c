@@ -7,8 +7,9 @@
 #include "nng/supplemental/nanolib/file.h"
 
 #ifdef NNG_PLATFORM_WINDOWS
-#define nano_mkdir(path, mode) mkdir(path)
+#define nano_mkdir(path, mode) _mkdir(path)
 #else
+#include <sys/stat.h>
 #define nano_mkdir(path, mode) mkdir(path, mode)
 #endif
 
