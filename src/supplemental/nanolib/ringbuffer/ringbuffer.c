@@ -9,12 +9,19 @@
 #include "nng/supplemental/nanolib/ringbuffer.h"
 #include "core/nng_impl.h"
 
-static inline int ringBuffer_get_msgs(ringBuffer_t *rb, int count, nng_msg ***list)
+static inline int ringBuffer_get_msgs(ringBuffer_t *rb, unsigned int *count, nng_msg ***list)
 {
 	unsigned int i = 0;
-	int j = 0;
+	unsigned int j = 0;
 
-	nng_msg **newList = nng_alloc(count * sizeof(nng_msg *));
+	nng_msg **newList = NULL;
+
+	if (*count == 0 || *count > rb->size) {
+		newList = nng_alloc(rb->size * sizeof(nng_msg *));
+		*count = rb->size;
+	} else {
+		newList = nng_alloc((*count) * sizeof(nng_msg *));
+	}
 	if (newList == NULL) {
 		return -1;
 	}
@@ -27,7 +34,7 @@ static inline int ringBuffer_get_msgs(ringBuffer_t *rb, int count, nng_msg ***li
 		newList[j] = msg;
 
 		j++;
-		if (j == count) {
+		if (j == *count) {
 			*list = newList;
 			return 0;
 		}
@@ -68,15 +75,18 @@ static inline void ringBuffer_clean_msgs(ringBuffer_t *rb, int needFree)
 	return;
 }
 
-static inline int ringBuffer_get_and_clean_msgs(ringBuffer_t *rb, unsigned int count, nng_msg ***list)
+int ringBuffer_get_and_clean_msgs(ringBuffer_t *rb,
+								  unsigned int *count, nng_msg ***list)
 {
 	int ret;
 
-	if (rb == NULL || count <= 0 || list == NULL) {
+	if (rb == NULL || list == NULL || count == NULL) {
 		return -1;
 	}
-
-	if (count > rb->size) {
+	if (rb->size == 0) {
+		*list = NULL;
+		*count = 0;
+		log_error("Ring buffer is empty!\n");
 		return -1;
 	}
 
@@ -656,17 +666,15 @@ static int put_msgs_to_aio(ringBuffer_t *rb, nng_aio *aio)
 
 	/* get all msgs and clean ringbuffer */
 	nni_msg **list = NULL;
-	ret = ringBuffer_get_and_clean_msgs(rb, rb->cap, &list);
+	ret = ringBuffer_get_and_clean_msgs(rb, &rb->cap, &list);
 	if (ret != 0 || list == NULL) {
 		log_error("Ring buffer is full and clean ringbuffer failed!\n");
-		nng_mtx_unlock(rb->ring_lock);
 		return -1;
 	}
 
 	/* Put list len in msg proto data */
 	list_len = nng_alloc(sizeof(int));
 	if (list_len == NULL) {
-		nng_mtx_unlock(rb->ring_lock);
 		log_error("alloc new list_len failed! no memory!\n");
 		return -1;
 	}
@@ -675,7 +683,6 @@ static int put_msgs_to_aio(ringBuffer_t *rb, nng_aio *aio)
 	nng_msg *tmsg;
 	ret = nng_msg_alloc(&tmsg, 0);
 	if (ret != 0 || tmsg == NULL) {
-		nng_mtx_unlock(rb->ring_lock);
 		log_error("alloc new msg failed! no memory!\n");
 		return -1;
 	}

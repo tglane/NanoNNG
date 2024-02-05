@@ -81,6 +81,40 @@ get_file_name(conf_parquet *conf, uint64_t key_start, uint64_t key_end)
 	return file_name;
 }
 
+string
+gen_random(const int len)
+{
+	static const char alphanum[] = "0123456789"
+	                               "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	                               "abcdefghijklmnopqrstuvwxyz";
+	std::string       tmp_s;
+	tmp_s.reserve(len);
+
+	for (int i = 0; i < len; ++i) {
+		tmp_s += alphanum[rand() % (sizeof(alphanum) - 1)];
+	}
+	return tmp_s;
+}
+
+static char *
+get_random_file_name(char *prefix, uint64_t key_start, uint64_t key_end)
+{
+	char *file_name = NULL;
+	char dir[]       = "/tmp";
+
+	file_name = (char *) malloc(strlen(prefix) + strlen(dir) +
+	    UINT64_MAX_DIGITS + UINT64_MAX_DIGITS + 16);
+	if (file_name == NULL) {
+		log_error("Failed to allocate memory for file name.");
+		return NULL;
+	}
+
+	sprintf(file_name, "%s/%s-%" PRIu64 "~%" PRIu64 ".parquet", dir,
+	    prefix, key_start, key_end);
+	log_error("file_name: %s", file_name);
+	return file_name;
+}
+
 static int
 remove_old_file(void)
 {
@@ -174,6 +208,7 @@ parquet_object_free(parquet_object *elem)
 int
 parquet_write_batch_async(parquet_object *elem)
 {
+	elem->type = WRITE_TO_NORMAL;
 	WAIT_FOR_AVAILABLE
 	pthread_mutex_lock(&parquet_queue_mutex);
 	if (IS_EMPTY(parquet_queue)) {
@@ -186,6 +221,23 @@ parquet_write_batch_async(parquet_object *elem)
 
 	return 0;
 }
+
+int  parquet_write_batch_tmp_async(parquet_object *elem)
+{
+	elem->type = WRITE_TO_TEMP;
+	WAIT_FOR_AVAILABLE
+	pthread_mutex_lock(&parquet_queue_mutex);
+	if (IS_EMPTY(parquet_queue)) {
+		pthread_cond_broadcast(&parquet_queue_not_empty);
+	}
+	ENQUEUE(parquet_queue, elem);
+	log_debug("enqueue element.");
+
+	pthread_mutex_unlock(&parquet_queue_mutex);
+
+	return 0;
+}
+
 
 bool
 need_new_one(const char *file_name, size_t file_max)
@@ -248,9 +300,99 @@ update_parquet_file_ranges(
 		parquet_file_range_free(
 		    elem->ranges->range[elem->ranges->start]);
 		elem->ranges->range[elem->ranges->start] = range;
-		elem->ranges->start = (++elem->ranges->start)%elem->ranges->size;
+		elem->ranges->start++;
+		elem->ranges->start %= elem->ranges->size;
 
 	}
+}
+
+int
+parquet_write_tmp(
+    conf_parquet *conf, shared_ptr<GroupNode> schema, parquet_object *elem)
+{
+	uint32_t old_index = 0;
+	uint32_t new_index = 0;
+again:
+
+	new_index = compute_new_index(elem, old_index, conf->file_size);
+	uint64_t key_start = elem->keys[old_index];
+	uint64_t key_end   = elem->keys[new_index];
+
+	string prefix = gen_random(6);
+	prefix = "nanomq" + prefix;
+	char *filename = get_random_file_name(prefix.data(), key_start, key_end);
+	if (filename == NULL) {
+		log_error("Failed to get file name");
+		return -1;
+	}
+
+	{
+		parquet_file_range *range = parquet_file_range_alloc(old_index, new_index, filename);
+		update_parquet_file_ranges(conf, elem, range);
+
+		// Create a ParquetFileWriter instance
+		parquet::WriterProperties::Builder builder;
+
+		builder.created_by("NanoMQ")
+		    ->version(parquet::ParquetVersion::PARQUET_2_6)
+		    ->data_page_version(parquet::ParquetDataPageVersion::V2)
+		    ->compression(static_cast<arrow::Compression::type>(
+		        conf->comp_type));
+
+		if (conf->encryption.enable) {
+			shared_ptr<parquet::FileEncryptionProperties>
+			    encryption_configurations;
+			encryption_configurations =
+			    parquet_set_encryption(conf);
+			builder.encryption(encryption_configurations);
+		}
+
+		shared_ptr<parquet::WriterProperties> props = builder.build();
+		using FileClass = arrow::io::FileOutputStream;
+		shared_ptr<FileClass> out_file;
+		PARQUET_ASSIGN_OR_THROW(out_file, FileClass::Open(filename));
+		std::shared_ptr<parquet::ParquetFileWriter> file_writer =
+		    parquet::ParquetFileWriter::Open(out_file, schema, props);
+
+		// Append a RowGroup with a specific number of rows.
+		parquet::RowGroupWriter *rg_writer =
+		    file_writer->AppendRowGroup();
+
+		// Write the Int64 column
+		parquet::Int64Writer *int64_writer =
+		    static_cast<parquet::Int64Writer *>(
+		        rg_writer->NextColumn());
+		for (uint32_t i = old_index; i <= new_index; i++) {
+			int64_t value            = elem->keys[i];
+			int16_t definition_level = 1;
+			int64_writer->WriteBatch(
+			    1, &definition_level, nullptr, &value);
+		}
+
+		// Write the ByteArray column. Make every alternate values NULL
+		parquet::ByteArrayWriter *ba_writer =
+		    static_cast<parquet::ByteArrayWriter *>(
+		        rg_writer->NextColumn());
+		for (uint32_t i = old_index; i <= new_index; i++) {
+			parquet::ByteArray value;
+			int16_t            definition_level = 1;
+			value.ptr                           = elem->darray[i];
+			value.len                           = elem->dsize[i];
+			ba_writer->WriteBatch(
+			    1, &definition_level, nullptr, &value);
+		}
+
+		old_index = new_index;
+
+		FREE_IF_NOT_NULL(
+		    filename, strlen(filename));
+
+		if (new_index != elem->size - 1)
+			goto again;
+	}
+
+	parquet_object_free(elem);
+	return 0;
 }
 
 int
@@ -375,7 +517,17 @@ parquet_write_loop_v2(void *config)
 
 		pthread_mutex_unlock(&parquet_queue_mutex);
 
-		parquet_write(conf, schema, ele);
+		switch (ele->type) {
+		case WRITE_TO_NORMAL:
+			parquet_write(conf, schema, ele);
+			break;
+		case WRITE_TO_TEMP:
+			parquet_write_tmp(conf, schema, ele);
+			break;
+		default:
+			break;
+		}
+
 	}
 }
 
@@ -454,20 +606,23 @@ parquet_find_span(uint64_t start_key, uint64_t end_key, uint32_t *size)
 	void        *elem       = NULL;
 
 	pthread_mutex_lock(&parquet_queue_mutex);
-	array = (const char **) nng_alloc(
-	    sizeof(char *) * parquet_file_queue.size);
+	if (parquet_file_queue.size != 0) {
+		array = (const char **) nng_alloc(
+		    sizeof(char *) * parquet_file_queue.size);
 
-	ret = array;
-	FOREACH_QUEUE(parquet_file_queue, elem)
-	{
-		if (elem) {
-			if (compare_callback_span(elem, low, high)) {
-				++local_size;
-				value    = nng_strdup((char *) elem);
-				*array++ = value;
+		ret = array;
+		FOREACH_QUEUE(parquet_file_queue, elem)
+		{
+			if (elem) {
+				if (compare_callback_span(elem, low, high)) {
+					++local_size;
+					value    = nng_strdup((char *) elem);
+					*array++ = value;
+				}
 			}
 		}
 	}
+
 	pthread_mutex_unlock(&parquet_queue_mutex);
 	(*size) = local_size;
 	return ret;
@@ -591,14 +746,15 @@ parquet_read(conf_parquet *conf, char *filename, uint64_t key, uint32_t *len)
 	return NULL;
 }
 
-parquet_data_packet *parquet_find_data_packet(conf_parquet *conf, char *filename, uint64_t key)
+parquet_data_packet *
+parquet_find_data_packet(conf_parquet *conf, char *filename, uint64_t key)
 {
 	WAIT_FOR_AVAILABLE
 	void *elem = NULL;
 	pthread_mutex_lock(&parquet_queue_mutex);
 	FOREACH_QUEUE(parquet_file_queue, elem)
 	{
-		if (elem && nng_strcasecmp((char*)elem, filename) == 0) {
+		if (elem && nng_strcasecmp((char *) elem, filename) == 0) {
 			goto find;
 		}
 	}
@@ -608,27 +764,32 @@ find:
 
 	if (elem) {
 		uint32_t size = 0;
-		uint8_t *data = parquet_read(conf, (char*) elem, key, &size);
+		uint8_t *data = parquet_read(conf, (char *) elem, key, &size);
 		if (size) {
-			parquet_data_packet *pack = (parquet_data_packet *)malloc(sizeof(parquet_data_packet));
+			parquet_data_packet *pack =
+			    (parquet_data_packet *) malloc(
+			        sizeof(parquet_data_packet));
 			pack->data = data;
 			pack->size = size;
 			return pack;
 		} else {
-			log_debug("No key %ld in file: %s", key, (char*) elem);
+			log_debug(
+			    "No key %ld in file: %s", key, (char *) elem);
 		}
 	}
-	log_debug("Not find file %s in file queue", (char*) elem);
+	log_debug("Not find file %s in file queue", (char *) elem);
 	return NULL;
 }
 
-
-parquet_data_packet **parquet_find_data_packets(conf_parquet *conf, char **filenames, uint64_t *keys, uint32_t len)
+parquet_data_packet **
+parquet_find_data_packets(
+    conf_parquet *conf, char **filenames, uint64_t *keys, uint32_t len)
 {
-	parquet_data_packet ** packets = (parquet_data_packet **) malloc(sizeof(parquet_data_packet*)*len);
+	parquet_data_packet **packets = (parquet_data_packet **) malloc(
+	    sizeof(parquet_data_packet *) * len);
 	for (uint32_t i = 0; i < len; i++) {
-		packets[i] = parquet_find_data_packet(conf, filenames[i], keys[i]);
+		packets[i] =
+		    parquet_find_data_packet(conf, filenames[i], keys[i]);
 	}
 	return packets;
 }
-
